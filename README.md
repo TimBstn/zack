@@ -36,8 +36,9 @@ is useful for repeating a short moment or creating a transition.
 ## Add subtitles
 
 Click the captions button in the toolbar to generate subtitles for the complete
-timeline. Zack includes its own local transcription engine and English model,
-so there is no Python, Conda, account, or separate download to configure.
+timeline. Zack includes its own local transcription engine, English model, and
+voice activity detection, so there is no Python, Conda, account, or separate
+download to configure.
 
 Choose **Zack → Settings → Subtitles** to set the maximum number of
 characters in each generated caption (spaces and punctuation count), and choose

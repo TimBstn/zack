@@ -99,6 +99,8 @@ final class NativeWhisperSubtitleService: @unchecked Sendable {
         process.executableURL = try NativeWhisperRuntime.cliURL()
         var arguments = [
             "--model", try NativeWhisperRuntime.modelURL().path,
+            "--vad",
+            "--vad-model", try NativeWhisperRuntime.vadModelURL().path,
             "--file", audioURL.path,
             "--language", "en",
             "--output-srt",
@@ -171,6 +173,14 @@ private enum NativeWhisperRuntime {
         let developmentModel = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("Resources/Whisper/ggml-small.en.bin")
         return try existingURL(bundleModel, fallback: developmentModel, name: "English transcription model")
+    }
+
+    static func vadModelURL() throws -> URL {
+        let bundleModel = Bundle.main.resourceURL?
+            .appendingPathComponent("Whisper/ggml-silero-v6.2.0.bin")
+        let developmentModel = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Resources/Whisper/ggml-silero-v6.2.0.bin")
+        return try existingURL(bundleModel, fallback: developmentModel, name: "voice activity detection model")
     }
 
     private static func executableURL(_ primary: URL, fallback: URL, name: String) throws -> URL {

@@ -23,6 +23,7 @@ for library in libwhisper.1.dylib libggml.0.dylib libggml-cpu.0.dylib libggml-bl
     cp -L "${whisper_bin_dir}/${library}" "${app_path}/Contents/Frameworks/${library}"
 done
 cp "${project_dir}/Resources/Whisper/ggml-small.en.bin" "${app_path}/Contents/Resources/Whisper/"
+cp "${project_dir}/Resources/Whisper/ggml-silero-v6.2.0.bin" "${app_path}/Contents/Resources/Whisper/"
 cp "${project_dir}/Resources/THIRD_PARTY_NOTICES.md" "${app_path}/Contents/Resources/"
 install_name_tool -add_rpath "@executable_path/../Frameworks" "${app_path}/Contents/MacOS/whisper-cli"
 
