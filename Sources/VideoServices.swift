@@ -124,10 +124,35 @@ final class NativeWhisperSubtitleService: @unchecked Sendable {
 
         let generatedSRT = outputStem.appendingPathExtension("srt")
         let contents = try String(contentsOf: generatedSRT, encoding: .utf8)
-        let subtitles = try parseSRT(contents)
+        let subtitles = cleanedSubtitles(try parseSRT(contents))
+        guard !subtitles.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
         if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-        try contents.write(to: destination, atomically: true, encoding: .utf8)
+        try renderSRT(subtitles).write(to: destination, atomically: true, encoding: .utf8)
         return subtitles
+    }
+
+    /// Some Whisper outputs include a literal blank-audio marker as a caption.
+    /// Keep it out of both the editor and the persisted SRT while preserving
+    /// any real text that might appear alongside the marker.
+    private func cleanedSubtitles(_ cues: [SubtitleCue]) -> [SubtitleCue] {
+        cues.compactMap { cue in
+            let text = cue.text
+                .replacingOccurrences(
+                    of: #"\[\s*blank(?:\s+(?:text|audio))?\s*\]"#,
+                    with: "",
+                    options: [.regularExpression, .caseInsensitive]
+                )
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            return SubtitleCue(id: cue.id, startTime: cue.startTime, endTime: cue.endTime, text: text)
+        }
+    }
+
+    private func renderSRT(_ cues: [SubtitleCue]) -> String {
+        cues.enumerated().map { index, cue in
+            "\(index + 1)\n\(srtTimestamp(cue.startTime)) --> \(srtTimestamp(cue.endTime))\n\(cue.text)"
+        }
+        .joined(separator: "\n\n") + "\n"
     }
 
     private func parseSRT(_ contents: String) throws -> [SubtitleCue] {
@@ -156,6 +181,15 @@ final class NativeWhisperSubtitleService: @unchecked Sendable {
               let minutes = Double(components[1]),
               let seconds = Double(components[2]) else { return nil }
         return hours * 3600 + minutes * 60 + seconds
+    }
+
+    private func srtTimestamp(_ seconds: Double) -> String {
+        let milliseconds = max(0, Int((seconds * 1_000).rounded()))
+        let hours = milliseconds / 3_600_000
+        let minutes = (milliseconds % 3_600_000) / 60_000
+        let remainingSeconds = (milliseconds % 60_000) / 1_000
+        let remainingMilliseconds = milliseconds % 1_000
+        return String(format: "%02d:%02d:%02d,%03d", hours, minutes, remainingSeconds, remainingMilliseconds)
     }
 }
 
