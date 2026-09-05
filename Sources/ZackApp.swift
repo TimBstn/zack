@@ -132,7 +132,7 @@ private struct AboutView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 18)
-            Text("Version 1.0").font(.caption).foregroundStyle(.tertiary)
+            Text("Version 0.2.0").font(.caption).foregroundStyle(.tertiary)
             Text("© 2026 Zack Studio").font(.caption).foregroundStyle(.tertiary)
             Button("Done") { dismiss() }
                 .buttonStyle(.borderedProminent)
