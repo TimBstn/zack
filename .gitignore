@@ -1,0 +1,17 @@
+# macOS and Swift build output
+.DS_Store
+.build/
+
+# Locally generated release artifacts (publish the DMG through GitHub Releases)
+dist/
+
+# Bundled transcription model: kept inside the release DMG, not Git history
+Resources/Whisper/*.bin
+
+# Local whisper.cpp checkout and its compiled native runtime
+# The source checkout has its own Git history and should not become an embedded
+# repository in Zack's GitHub repository.
+Vendor/whisper.cpp/
+
+# Intermediate PNG sizes used only to generate the final Zack.icns
+Resources/Branding/Zack.iconset/
