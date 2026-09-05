@@ -89,13 +89,13 @@ private struct PreviewPane: View {
     @EnvironmentObject private var project: ProjectStore
 
     private enum PreviewMode: String, CaseIterable, Identifiable {
-        case selected = "Selected"
         case fullVideo = "Full Video"
+        case selected = "Selected"
 
         var id: Self { self }
     }
 
-    @State private var mode: PreviewMode = .selected
+    @State private var mode: PreviewMode = .fullVideo
     @State private var player = AVPlayer()
     @State private var time: Double = 0
     @State private var playing = false
