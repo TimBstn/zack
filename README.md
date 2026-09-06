@@ -43,6 +43,29 @@ loud recording do not read the same at 100%. Keep the meter below the -1 dB
 safe ceiling; yellow and red can distort footage that was already loud. Audio
 levels are saved in the project and applied to the exported MP4.
 
+## Fade video clips
+
+Select a video clip to open its **Video** sidebar. Open **Transition** and set
+Fade in or Fade out in seconds. Fades are rendered in the full-video preview
+and exported MP4.
+
+## Add music
+
+Open the Music row below the video timeline and use its **+** button to import
+an audio file. Music appears in its own lane beneath the video timeline. Drag
+a music block left or right to set where it starts; Zack keeps the whole block
+inside the finished video so it never visually changes length while moving.
+Drag either orange cutter directly for live trimming. Select a block to set its independent volume, song
+offset, and fades in the Music panel. Zack mixes music beneath your video audio in preview
+and export, stopping it when the video ends.
+
+The Music panel also offers optional fade-in and fade-out durations, up to 12
+seconds each, for smoother starts and endings. Use **Song offset** to begin at
+a later point inside the music file without moving its block on the timeline.
+
+Music tiles support the same editing shortcuts as video clips: Command-C,
+Command-V, Command-D, and Delete.
+
 ## Choose an output
 
 Choose **Zack → Settings → Video** before exporting:
@@ -59,7 +82,8 @@ shown with black bars rather than stretched.
 Click the captions button in the toolbar to generate subtitles for the complete
 timeline. Zack includes its own local transcription engine, English model, and
 voice activity detection, so there is no Python, Conda, account, or separate
-download to configure.
+download to configure. Background music is excluded from the transcription
+source so it cannot interfere with speech detection.
 
 Choose **Zack → Settings → Subtitles** to set the maximum number of
 characters in each generated caption (spaces and punctuation count), and choose

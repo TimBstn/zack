@@ -1,12 +1,16 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 @MainActor
 final class ProjectStore: ObservableObject {
     private static let clipPasteboardType = NSPasteboard.PasteboardType("com.zack.clip")
+    private static let musicPasteboardType = NSPasteboard.PasteboardType("com.zack.music")
 
     @Published var clips: [VideoClip] = []
+    @Published var musicClips: [MusicClip] = []
     @Published var selectedID: UUID?
+    @Published var selectedMusicID: UUID?
     @Published var exportState: ExportState = .idle
     @Published var subtitleState: SubtitleState = .idle
     @Published var subtitles: [SubtitleCue] = []
@@ -14,9 +18,14 @@ final class ProjectStore: ObservableObject {
     @Published var subtitleLayout = SubtitleLayout()
     @Published var outputFormat: VideoOutputFormat = .youtube
     @Published var playbackToggleCount = 0
+    /// Shared UI-only time in the assembled timeline; it is never saved.
+    @Published var timelinePlayhead: Double?
     @Published var isSubtitleEditorVisible = false
     @Published var isSubtitleLayoutEditorVisible = false
     @Published var isAudioEditorVisible = false
+    @Published var isMusicTimelineVisible = false
+    @Published private(set) var isEditingMusicTimeline = false
+    @Published private(set) var musicTimelineCommit = 0
     @Published private(set) var hasUnsavedChanges = false
     @Published var errorMessage: String?
     @Published var isImporting = false
@@ -24,11 +33,13 @@ final class ProjectStore: ObservableObject {
     private var undoStack: [[VideoClip]] = []
     private var redoStack: [[VideoClip]] = []
     private let metadata = VideoMetadataService()
+    private let musicMetadata = MusicMetadataService()
     private let exporter = VideoExportService()
     private let whisper = NativeWhisperSubtitleService()
     private var projectURL: URL?
 
     var selectedClip: VideoClip? { clips.first { $0.id == selectedID } }
+    var selectedMusic: MusicClip? { musicClips.first { $0.id == selectedMusicID } }
     var selectedIndex: Int? { clips.firstIndex { $0.id == selectedID } }
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
@@ -36,6 +47,10 @@ final class ProjectStore: ObservableObject {
         guard let data = NSPasteboard.general.data(forType: Self.clipPasteboardType) else { return false }
         return (try? JSONDecoder().decode(VideoClip.self, from: data)) != nil
     }
+    var canPasteTimelineItem: Bool {
+        canPasteClip || NSPasteboard.general.data(forType: Self.musicPasteboardType) != nil
+    }
+    var hasSelectedTimelineItem: Bool { selectedClip != nil || selectedMusic != nil }
     var isGeneratingSubtitles: Bool {
         subtitleState == .rendering || subtitleState == .transcribing
     }
@@ -88,7 +103,7 @@ final class ProjectStore: ObservableObject {
         hasUnsavedChanges = true
     }
 
-    func newProject() { clips = []; subtitles = []; subtitleStyle = .classic; subtitleLayout = SubtitleLayout(); outputFormat = .youtube; isSubtitleLayoutEditorVisible = false; isAudioEditorVisible = false; selectedID = nil; projectURL = nil; hasUnsavedChanges = false }
+    func newProject() { clips = []; musicClips = []; subtitles = []; subtitleStyle = .classic; subtitleLayout = SubtitleLayout(); outputFormat = .youtube; isSubtitleLayoutEditorVisible = false; isAudioEditorVisible = false; isMusicTimelineVisible = false; selectedID = nil; selectedMusicID = nil; projectURL = nil; hasUnsavedChanges = false }
     func importVideos() {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie]
         panel.allowsMultipleSelection = true; panel.canChooseDirectories = false
@@ -105,7 +120,30 @@ final class ProjectStore: ObservableObject {
             clips.append(contentsOf: imported); selectedID = imported.last?.id ?? selectedID; isImporting = false
         }
     }
-    func select(_ id: UUID) { selectedID = id }
+    func importMusic() {
+        isMusicTimelineVisible = true
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        if panel.runModal() == .OK { addMusic(urls: panel.urls) }
+    }
+    func addMusic(urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        Task {
+            var imported: [MusicClip] = []
+            for url in urls {
+                do { imported.append(try await musicMetadata.clip(for: url)) }
+                catch { errorMessage = "\(url.lastPathComponent) couldn’t be imported. Choose a playable audio file." }
+            }
+            musicClips.append(contentsOf: imported)
+            selectedMusicID = imported.last?.id ?? selectedMusicID
+            selectedID = nil
+            hasUnsavedChanges = true
+        }
+    }
+    func select(_ id: UUID) { selectedID = id; selectedMusicID = nil }
+    func selectMusic(_ id: UUID) { selectedMusicID = id; selectedID = nil }
     func copySelectedClip() {
         guard let clip = selectedClip, let data = try? JSONEncoder().encode(clip) else { return }
         let pasteboard = NSPasteboard.general
@@ -124,6 +162,27 @@ final class ProjectStore: ObservableObject {
     func duplicateSelectedClip() {
         copySelectedClip()
         pasteClip()
+    }
+    func copySelectedTimelineItem() {
+        if let music = selectedMusic, let data = try? JSONEncoder().encode(music) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setData(data, forType: Self.musicPasteboardType)
+        } else { copySelectedClip() }
+    }
+    func pasteTimelineItem() {
+        if let data = NSPasteboard.general.data(forType: Self.musicPasteboardType), var copy = try? JSONDecoder().decode(MusicClip.self, from: data) {
+            copy.id = UUID()
+            copy.timelineStart += 0.5
+            musicClips.append(copy)
+            selectMusic(copy.id)
+            hasUnsavedChanges = true
+        } else { pasteClip() }
+    }
+    func duplicateSelectedTimelineItem() { copySelectedTimelineItem(); pasteTimelineItem() }
+    func removeSelectedTimelineItem() {
+        if let id = selectedMusicID, let index = musicClips.firstIndex(where: { $0.id == id }) {
+            musicClips.remove(at: index); selectedMusicID = nil; hasUnsavedChanges = true
+        } else { removeSelected() }
     }
     func requestSubtitles() {
         guard !clips.isEmpty else { return }
@@ -144,7 +203,10 @@ final class ProjectStore: ObservableObject {
             .appendingPathExtension("mp4")
         Task {
             do {
-                _ = try await exporter.export(clips: timeline, outputFormat: selectedOutputFormat, to: temporaryVideo, progress: { _ in })
+                // Background music belongs in the final export, not in the
+                // transcription source: it can confuse VAD and Whisper's
+                // speech boundaries, especially before the first spoken word.
+                _ = try await exporter.export(clips: timeline, musicClips: [], outputFormat: selectedOutputFormat, to: temporaryVideo, progress: { _ in })
                 defer { try? FileManager.default.removeItem(at: temporaryVideo) }
                 subtitleState = .transcribing
                 subtitles = try await whisper.transcribe(
@@ -181,6 +243,27 @@ final class ProjectStore: ObservableObject {
         if let start { clips[index].trimStart = min(max(0, start), clips[index].trimEnd - 0.1) }
         if let end { clips[index].trimEnd = max(min(clips[index].sourceDuration, end), clips[index].trimStart + 0.1) }
     }
+    func updateVideoTransition(id: UUID, fadeInDuration: Double? = nil, fadeOutDuration: Double? = nil) {
+        guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
+        if let fadeInDuration { clips[index].fadeInDuration = min(max(fadeInDuration, 0), clips[index].duration) }
+        if let fadeOutDuration { clips[index].fadeOutDuration = min(max(fadeOutDuration, 0), clips[index].duration) }
+        hasUnsavedChanges = true
+    }
+    func updateMusic(id: UUID, start: Double? = nil, end: Double? = nil, timelineStart: Double? = nil, volume: Double? = nil, fadeInDuration: Double? = nil, fadeOutDuration: Double? = nil) {
+        guard let index = musicClips.firstIndex(where: { $0.id == id }) else { return }
+        if let start { musicClips[index].trimStart = min(max(0, start), musicClips[index].trimEnd - 0.1) }
+        if let end { musicClips[index].trimEnd = max(min(musicClips[index].sourceDuration, end), musicClips[index].trimStart + 0.1) }
+        if let timelineStart { musicClips[index].timelineStart = max(0, timelineStart) }
+        if let volume { musicClips[index].volume = min(max(volume, 0), 2) }
+        if let fadeInDuration { musicClips[index].fadeInDuration = min(max(fadeInDuration, 0), musicClips[index].duration) }
+        if let fadeOutDuration { musicClips[index].fadeOutDuration = min(max(fadeOutDuration, 0), musicClips[index].duration) }
+        hasUnsavedChanges = true
+    }
+    func beginMusicTimelineEdit() { isEditingMusicTimeline = true }
+    func finishMusicTimelineEdit() {
+        isEditingMusicTimeline = false
+        musicTimelineCommit += 1
+    }
     func commitTrim() { snapshot() }
     func move(from: IndexSet, to: Int) { snapshot(); clips.move(fromOffsets: from, toOffset: to) }
     func removeSelected() { guard let id = selectedID, let i = clips.firstIndex(where: {$0.id == id}) else { return }; snapshot(); clips.remove(at: i); selectedID = clips.indices.contains(i) ? clips[i].id : clips.last?.id }
@@ -195,7 +278,7 @@ final class ProjectStore: ObservableObject {
         guard !clips.isEmpty else { return }; exportState = .exporting(0)
         let selectedOutputFormat = outputFormat
         Task {
-            do { let output = try await exporter.export(clips: clips, outputFormat: selectedOutputFormat, to: url) { progress in Task { @MainActor in self.exportState = .exporting(progress) } }; exportState = .success(output) }
+            do { let output = try await exporter.export(clips: clips, musicClips: musicClips, outputFormat: selectedOutputFormat, to: url) { progress in Task { @MainActor in self.exportState = .exporting(progress) } }; exportState = .success(output) }
             catch { exportState = .failure("Your video couldn’t be exported. Check that the destination has free space and try again.") }
         }
     }
@@ -208,7 +291,7 @@ final class ProjectStore: ObservableObject {
     }
     private func writeProject(to url: URL) -> Bool {
         do {
-            try JSONEncoder().encode(ZackProject(clips: clips, subtitles: subtitles, subtitleStyle: subtitleStyle, subtitleLayout: subtitleLayout, outputFormat: outputFormat)).write(to: url)
+            try JSONEncoder().encode(ZackProject(clips: clips, musicClips: musicClips, subtitles: subtitles, subtitleStyle: subtitleStyle, subtitleLayout: subtitleLayout, outputFormat: outputFormat)).write(to: url)
             projectURL = url
             hasUnsavedChanges = false
             return true
@@ -217,5 +300,5 @@ final class ProjectStore: ObservableObject {
             return false
         }
     }
-    func openProject() { let panel = NSOpenPanel(); panel.allowedContentTypes = [.init(filenameExtension: "zack")!]; if panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url), let project = try? JSONDecoder().decode(ZackProject.self, from: data) { clips = project.clips; subtitles = project.subtitles; subtitleStyle = project.subtitleStyle; subtitleLayout = project.subtitleLayout; outputFormat = project.outputFormat; isSubtitleLayoutEditorVisible = false; isAudioEditorVisible = false; selectedID = clips.first?.id; projectURL = url; hasUnsavedChanges = false } }
+    func openProject() { let panel = NSOpenPanel(); panel.allowedContentTypes = [.init(filenameExtension: "zack")!]; if panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url), let project = try? JSONDecoder().decode(ZackProject.self, from: data) { clips = project.clips; musicClips = project.musicClips; subtitles = project.subtitles; subtitleStyle = project.subtitleStyle; subtitleLayout = project.subtitleLayout; outputFormat = project.outputFormat; isSubtitleLayoutEditorVisible = false; isAudioEditorVisible = false; isMusicTimelineVisible = false; selectedID = clips.first?.id; selectedMusicID = nil; projectURL = url; hasUnsavedChanges = false } }
 }

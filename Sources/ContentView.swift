@@ -66,6 +66,12 @@ private struct EditorView: View {
         VStack(spacing: 0) {
             HStack(spacing: 16) {
                 PreviewPane().frame(maxWidth: .infinity, maxHeight: .infinity)
+                if project.selectedMusic != nil {
+                    MusicEditor().frame(width: 270).frame(maxHeight: .infinity)
+                }
+                if project.selectedClip != nil {
+                    VideoEditor().frame(width: 270).frame(maxHeight: .infinity)
+                }
                 if project.isAudioEditorVisible, project.selectedClip != nil {
                     AudioEditor().frame(width: 270).frame(maxHeight: .infinity)
                 }
@@ -76,7 +82,7 @@ private struct EditorView: View {
             .padding(.horizontal, 30)
             .padding(.top, 12)
             Divider().padding(.top, 16)
-            TimelineView().frame(height: 206).padding(.horizontal, 25)
+            TimelineView().frame(height: project.isMusicTimelineVisible ? 315 : 206).padding(.horizontal, 25)
             Footer().padding(.horizontal, 30).padding(.vertical, 14)
         }
         .contentShape(Rectangle())
@@ -130,7 +136,11 @@ private struct PreviewPane: View {
 
             ZStack {
                 RoundedRectangle(cornerRadius: 12).fill(Color.black.opacity(0.9))
-                if selectedClip != nil { PlayerSurface(player: player).clipShape(RoundedRectangle(cornerRadius: 12)) } else { Image(systemName: "film").font(.largeTitle).foregroundStyle(.white.opacity(0.4)) }
+                if mode == .fullVideo ? !project.clips.isEmpty : selectedClip != nil {
+                    PlayerSurface(player: player).clipShape(RoundedRectangle(cornerRadius: 12))
+                } else {
+                    Image(systemName: "film").font(.largeTitle).foregroundStyle(.white.opacity(0.4))
+                }
                 if mode == .fullVideo, let subtitle = project.subtitle(at: time) {
                     GeometryReader { geometry in
                         SubtitleOverlay(text: subtitle.text, style: project.subtitleStyle)
@@ -157,39 +167,60 @@ private struct PreviewPane: View {
         }
         .onChange(of: mode) { _, _ in load() }
         .onChange(of: project.selectedID) { _, _ in if mode == .selected { load() } }
-        .onChange(of: project.clips) { _, _ in load() }
-        .onChange(of: project.outputFormat) { _, _ in load() }
+        .onChange(of: project.clips) { oldValue, newValue in
+            if hasSameVideoLayout(oldValue, newValue) { applyLiveAudioMix() }
+            else { load(preservingPlayback: true) }
+        }
+        .onChange(of: project.musicClips) { oldValue, newValue in
+            guard mode == .fullVideo else { return }
+            guard !project.isEditingMusicTimeline else { return }
+            if hasSameMusicLayout(oldValue, newValue) { applyLiveAudioMix() }
+            else { load(preservingPlayback: true) }
+        }
+        .onChange(of: project.musicTimelineCommit) { _, _ in
+            if mode == .fullVideo { load(preservingPlayback: true) }
+        }
+        .onChange(of: project.outputFormat) { _, _ in load(preservingPlayback: true) }
         .onChange(of: project.playbackToggleCount) { _, _ in toggle() }
         .onAppear { load() }
-        .onDisappear { stop() }
+        .onDisappear { stop(); project.timelinePlayhead = nil }
     }
-    private func load() {
+    private func load(preservingPlayback: Bool = false) {
+        let resumeTime = preservingPlayback ? time : 0
+        let shouldResume = preservingPlayback && playing
         stop()
         let token = UUID()
         loadToken = token
 
         if mode == .selected {
             guard let clip = selectedClip else { player.replaceCurrentItem(with: nil); return }
-            time = clip.trimStart
+            time = preservingPlayback ? min(max(resumeTime, clip.trimStart), clip.trimEnd) : clip.trimStart
+            updateTimelinePlayhead()
             player.replaceCurrentItem(with: AVPlayerItem(url: clip.sourceURL))
             player.volume = Float(clip.volume)
-            player.seek(to: CMTime(seconds: clip.trimStart, preferredTimescale: 600))
+            player.seek(to: CMTime(seconds: time, preferredTimescale: 600)) { _ in
+                if shouldResume { Task { @MainActor in self.toggle() } }
+            }
             return
         }
 
         let clips = project.clips
         let outputFormat = project.outputFormat
         guard !clips.isEmpty else { player.replaceCurrentItem(with: nil); return }
-        time = 0
+        time = min(resumeTime, duration)
+        updateTimelinePlayhead()
         player.replaceCurrentItem(with: nil)
         Task {
             do {
-                let timeline = try await TimelineCompositionService.make(clips: clips, outputFormat: outputFormat)
+                let timeline = try await TimelineCompositionService.make(clips: clips, musicClips: project.musicClips, outputFormat: outputFormat)
                 guard loadToken == token else { return }
                 let item = AVPlayerItem(asset: timeline.composition)
                 item.videoComposition = timeline.videoComposition
                 item.audioMix = timeline.audioMix
                 player.replaceCurrentItem(with: item)
+                player.seek(to: CMTime(seconds: time, preferredTimescale: 600)) { _ in
+                    if shouldResume { Task { @MainActor in self.toggle() } }
+                }
             } catch {
                 guard loadToken == token else { return }
                 project.errorMessage = "The full video preview couldn’t be created. Check that all clips are still available."
@@ -197,9 +228,49 @@ private struct PreviewPane: View {
         }
     }
     private func stop() { timer?.invalidate(); timer = nil; player.pause(); playing = false }
+    private func hasSameVideoLayout(_ oldValue: [VideoClip], _ newValue: [VideoClip]) -> Bool {
+        guard oldValue.count == newValue.count else { return false }
+        return zip(oldValue, newValue).allSatisfy {
+            $0.id == $1.id && $0.sourceURL == $1.sourceURL && $0.trimStart == $1.trimStart && $0.trimEnd == $1.trimEnd && $0.fadeInDuration == $1.fadeInDuration && $0.fadeOutDuration == $1.fadeOutDuration
+        }
+    }
+    private func hasSameMusicLayout(_ oldValue: [MusicClip], _ newValue: [MusicClip]) -> Bool {
+        guard oldValue.count == newValue.count else { return false }
+        return zip(oldValue, newValue).allSatisfy {
+            $0.id == $1.id && $0.sourceURL == $1.sourceURL && $0.trimStart == $1.trimStart && $0.trimEnd == $1.trimEnd && $0.timelineStart == $1.timelineStart
+        }
+    }
+    private func applyLiveAudioMix() {
+        if mode == .selected {
+            player.volume = Float(selectedClip?.volume ?? 1)
+            return
+        }
+        guard let item = player.currentItem,
+              let composition = item.asset as? AVComposition else {
+            load(preservingPlayback: true)
+            return
+        }
+        item.audioMix = TimelineCompositionService.liveAudioMix(clips: project.clips, musicClips: project.musicClips, composition: composition)
+    }
     private func seek(to seconds: Double) {
         time = seconds
+        updateTimelinePlayhead()
         player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600))
+    }
+
+    private func updateTimelinePlayhead() {
+        switch mode {
+        case .fullVideo:
+            project.timelinePlayhead = min(max(0, time), duration)
+        case .selected:
+            guard let clip = selectedClip,
+                  let selectedIndex = project.clips.firstIndex(where: { $0.id == clip.id }) else {
+                project.timelinePlayhead = nil
+                return
+            }
+            let start = project.clips.prefix(selectedIndex).reduce(0) { $0 + $1.duration }
+            project.timelinePlayhead = start + min(max(0, time - clip.trimStart), clip.duration)
+        }
     }
     private func toggle() {
         if playing { stop(); return }
@@ -211,6 +282,7 @@ private struct PreviewPane: View {
         timer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [self] _ in
             Task { @MainActor in
                 time = player.currentTime().seconds
+                updateTimelinePlayhead()
                 let endTime = mode == .selected ? (selectedClip?.trimEnd ?? sliderRange.upperBound) : sliderRange.upperBound
                 if time >= endTime { stop() }
             }
@@ -414,6 +486,160 @@ private struct AudioEditor: View {
     }
 }
 
+private struct VideoEditor: View {
+    @EnvironmentObject private var project: ProjectStore
+    @State private var isTransitionVisible = false
+    private var clip: VideoClip? { project.selectedClip }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Video").font(.headline)
+                    Text(clip?.name ?? "No video selected").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                Button { project.selectedID = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+            }
+            .padding(12)
+            Divider().padding(.horizontal, 12)
+            if let clip {
+                VStack(alignment: .leading, spacing: 8) {
+                    Button {
+                        isTransitionVisible.toggle()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("Transition").font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Image(systemName: isTransitionVisible ? "chevron.up" : "chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if isTransitionVisible {
+                        VStack(alignment: .leading, spacing: 14) {
+                            fadeSlider("Fade in", value: clip.fadeInDuration, maximum: clip.duration) {
+                                project.updateVideoTransition(id: clip.id, fadeInDuration: $0)
+                            }
+                            fadeSlider("Fade out", value: clip.fadeOutDuration, maximum: clip.duration) {
+                                project.updateVideoTransition(id: clip.id, fadeOutDuration: $0)
+                            }
+                        }
+                    }
+                }
+                .padding(12)
+            }
+            Spacer()
+        }
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func fadeSlider(_ title: String, value: Double, maximum: Double, onChange: @escaping (Double) -> Void) -> some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(title).font(.caption.weight(.medium))
+                Spacer()
+                Text(value.editableTimeLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            Slider(value: Binding(get: { value }, set: onChange), in: 0...min(12, maximum)).tint(.orange)
+        }
+    }
+}
+
+private struct MusicEditor: View {
+    @EnvironmentObject private var project: ProjectStore
+    private var music: MusicClip? { project.selectedMusic }
+    @State private var isGeneralVisible = false
+    @State private var isFadeVisible = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Music").font(.headline)
+                    Text(music?.name ?? "No music selected").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                Button { project.selectedMusicID = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+            }.padding(12)
+            Divider().padding(.horizontal, 12)
+            if let music {
+                VStack(alignment: .leading, spacing: 8) {
+                    Button {
+                        isGeneralVisible.toggle()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("General").font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Image(systemName: isGeneralVisible ? "chevron.up" : "chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if isGeneralVisible {
+                        VStack(alignment: .leading, spacing: 14) {
+                            VStack(spacing: 4) {
+                                HStack { Text("Music volume").font(.caption.weight(.medium)); Spacer(); Text("\(Int((music.volume * 100).rounded()))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+                                Slider(value: Binding(get: { project.selectedMusic?.volume ?? music.volume }, set: { project.updateMusic(id: music.id, volume: $0) }), in: 0...2).tint(.orange)
+                            }
+                            VStack(spacing: 4) {
+                                HStack { Text("Song offset").font(.caption.weight(.medium)); Spacer(); Text(music.trimStart.editableTimeLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+                                Slider(
+                                    value: Binding(get: { project.selectedMusic?.trimStart ?? music.trimStart }, set: { project.updateMusic(id: music.id, start: $0) }),
+                                    in: 0...max(0.1, music.trimEnd - 0.1)
+                                )
+                                .tint(.orange)
+                            }
+                        }
+                    }
+
+                    Button {
+                        isFadeVisible.toggle()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("Fade").font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Image(systemName: isFadeVisible ? "chevron.up" : "chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if isFadeVisible {
+                        VStack(alignment: .leading, spacing: 14) {
+                            musicFadeSlider("Fade in", value: music.fadeInDuration, maximum: music.duration) {
+                                project.updateMusic(id: music.id, fadeInDuration: $0)
+                            }
+                            musicFadeSlider("Fade out", value: music.fadeOutDuration, maximum: music.duration) {
+                                project.updateMusic(id: music.id, fadeOutDuration: $0)
+                            }
+                        }
+                    }
+                }
+                .padding(12)
+            }
+            Spacer()
+        }
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func musicFadeSlider(_ title: String, value: Double, maximum: Double, onChange: @escaping (Double) -> Void) -> some View {
+        VStack(spacing: 4) {
+            HStack { Text(title).font(.caption.weight(.medium)); Spacer(); Text(value.editableTimeLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+            Slider(value: Binding(get: { value }, set: onChange), in: 0...min(12, maximum)).tint(.orange)
+        }
+    }
+
+}
+
 private struct VolumeMeter: View {
     let outputPeakDecibels: Double?
     private let segmentCount = 14
@@ -482,7 +708,7 @@ private struct InlineSubtitleEditor: View {
                 Button {
                     isStylePickerVisible.toggle()
                 } label: {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 0) {
                         Text("Caption style").font(.subheadline.weight(.semibold))
                         Spacer()
                         Text(project.subtitleStyle.name).font(.caption).foregroundStyle(.secondary)
@@ -877,12 +1103,14 @@ private final class PlayerLayerView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        videoLayer.backgroundColor = NSColor.black.cgColor
         layer = videoLayer
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         wantsLayer = true
+        videoLayer.backgroundColor = NSColor.black.cgColor
         layer = videoLayer
     }
 
@@ -894,6 +1122,8 @@ private struct TimelineView: View {
     @EnvironmentObject private var project: ProjectStore
     @State private var draggedClipID: UUID?
     @State private var insertion: TimelineInsertion?
+    @State private var zoom: Double = 12
+    @State private var fitRequest = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -901,31 +1131,88 @@ private struct TimelineView: View {
                 Text("Timeline").font(.headline)
                 Text("\(project.clips.count) \(project.clips.count == 1 ? "clip" : "clips")").font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                Image(systemName: "minus.magnifyingglass").font(.caption).foregroundStyle(.secondary)
+                Slider(value: $zoom, in: 4...36, step: 1).frame(width: 110).tint(.orange)
+                Image(systemName: "plus.magnifyingglass").font(.caption).foregroundStyle(.secondary)
+                Text("\(Int(zoom)) px/s").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                Button("Fit") { fitRequest += 1 }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Fit the full video timeline in view")
                 if let clip = project.selectedClip { Text("Selected: \(clip.name) · \(clip.duration.timeLabel)").font(.caption).foregroundStyle(.secondary) }
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(Array(project.clips.enumerated()), id: \.element.id) { index, clip in
-                        ClipTile(
-                            clip: clip,
-                            index: index,
-                            showInsertionBefore: insertion?.targetID == clip.id && insertion?.placeAfter == false,
-                            showInsertionAfter: insertion?.targetID == clip.id && insertion?.placeAfter == true
-                        )
-                        .onDrag {
-                            draggedClipID = clip.id
-                            return NSItemProvider(object: clip.id.uuidString as NSString)
+            GeometryReader { geometry in
+                let importWidth: CGFloat = 48
+                let usableWidth = max(120, geometry.size.width - importWidth)
+                let scale = TimelineScale(clips: project.clips, viewportWidth: usableWidth, pointsPerSecond: CGFloat(zoom))
+                ScrollView(.horizontal, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 0) {
+                            ForEach(Array(project.clips.enumerated()), id: \.element.id) { index, clip in
+                                ClipTile(
+                                    clip: clip,
+                                    index: index,
+                                    width: scale.width(for: clip),
+                                    showInsertionBefore: insertion?.targetID == clip.id && insertion?.placeAfter == false,
+                                    showInsertionAfter: insertion?.targetID == clip.id && insertion?.placeAfter == true
+                                )
+                                .onDrag {
+                                    draggedClipID = clip.id
+                                    return NSItemProvider(object: clip.id.uuidString as NSString)
+                                }
+                                .onDrop(of: [.text], delegate: ClipDropDelegate(
+                                    target: clip,
+                                    targetWidth: scale.width(for: clip),
+                                    project: project,
+                                    draggedClipID: $draggedClipID,
+                                    insertion: $insertion
+                                ))
+                            }
+                            Spacer(minLength: max(0, scale.totalWidth - scale.contentWidth))
+                            Button { project.importVideos() } label: { Image(systemName: "plus").font(.title3).frame(width: 48, height: 122).background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 9)) }.buttonStyle(.plain).help("Import more clips")
                         }
-                        .onDrop(of: [.text], delegate: ClipDropDelegate(
-                            target: clip,
-                            targetWidth: ClipTile.displayWidth(for: clip),
-                            project: project,
-                            draggedClipID: $draggedClipID,
-                            insertion: $insertion
-                        ))
+                        .overlay(alignment: .topLeading) {
+                            if let playhead = project.timelinePlayhead, !project.clips.isEmpty {
+                                TimelinePlayhead(height: 104)
+                                    .offset(x: scale.x(for: playhead) - 1)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        Divider()
+                        Button {
+                            project.isMusicTimelineVisible.toggle()
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: project.isMusicTimelineVisible ? "chevron.down" : "chevron.right")
+                                    .font(.caption2.weight(.semibold))
+                                Image(systemName: "music.note")
+                                Text("Music").font(.caption.weight(.semibold))
+                                Spacer()
+                            }
+                            .foregroundStyle(.secondary)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: scale.totalWidth, alignment: .leading)
+                        if project.isMusicTimelineVisible {
+                            HStack(spacing: 0) {
+                                MusicTimelineLane(scale: scale)
+                                Button { project.importMusic() } label: {
+                                    Image(systemName: "plus")
+                                        .font(.headline)
+                                        .frame(width: 48, height: 76)
+                                        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
+                                }
+                                .buttonStyle(.plain)
+                                .help("Import music")
+                            }
+                        }
                     }
-                    Button { project.importVideos() } label: { Image(systemName: "plus").font(.title3).frame(width: 48, height: 122).background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 9)) }.buttonStyle(.plain).help("Import more clips")
-                }.padding(.vertical, 3)
+                }
+                .onChange(of: fitRequest) { _, _ in
+                    let totalDuration = max(0.1, project.clips.reduce(0) { $0 + $1.duration })
+                    zoom = min(36, max(4, Double(usableWidth) / totalDuration))
+                }
             }
         }.padding(.vertical, 14)
     }
@@ -936,53 +1223,305 @@ private struct TimelineInsertion: Equatable {
     let placeAfter: Bool
 }
 
+/// A single linear time scale shared by the video and music lanes. Unlike the
+/// former fit-to-window layout, one second always occupies the same width.
+private struct TimelineScale {
+    let contentWidth: CGFloat
+    let totalWidth: CGFloat
+    private let duration: Double
+    private let pointsPerSecond: CGFloat
+
+    init(clips: [VideoClip], viewportWidth: CGFloat, pointsPerSecond: CGFloat) {
+        duration = max(0.1, clips.reduce(0) { $0 + $1.duration })
+        self.pointsPerSecond = pointsPerSecond
+        contentWidth = CGFloat(duration) * pointsPerSecond
+        totalWidth = max(viewportWidth, contentWidth)
+    }
+
+    func width(for clip: VideoClip) -> CGFloat { CGFloat(clip.duration) * pointsPerSecond }
+    func x(for time: Double) -> CGFloat { CGFloat(min(max(0, time), duration)) * pointsPerSecond }
+    func time(for x: CGFloat) -> Double { min(max(0, Double(x / pointsPerSecond)), duration) }
+}
+
+private struct MusicTimelineLane: View {
+    @EnvironmentObject private var project: ProjectStore
+    let scale: TimelineScale
+    @State private var activeEdit: ActiveMusicEdit?
+    @State private var draft: MusicEditDraft?
+
+    private var videoDuration: Double { scale.time(for: scale.totalWidth) }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.035))
+            ForEach(project.musicClips) { music in
+                MusicTimelineClip(
+                    music: music,
+                    scale: scale,
+                    draft: activeEdit?.musicID == music.id ? draft : nil
+                )
+            }
+        }
+        .frame(width: scale.totalWidth, height: 76)
+        .overlay(alignment: .topLeading) { Text("Music").font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(6) }
+        .overlay(alignment: .topLeading) {
+            if let playhead = project.timelinePlayhead {
+                TimelinePlayhead(height: 76)
+                    .offset(x: scale.x(for: playhead) - 1)
+                    .allowsHitTesting(false)
+            }
+        }
+        // The lane owns the gesture, not the block that changes width beneath
+        // the pointer. A drag remains captured even while trimming turns a
+        // short block into a long one (or vice versa).
+        .contentShape(Rectangle())
+        .gesture(timelineGesture)
+    }
+
+    private func displayWidth(for music: MusicClip, edit: MusicEditDraft) -> CGFloat {
+        let visibleDuration = min(max(0.1, edit.trimEnd - edit.trimStart), max(0.1, videoDuration - edit.timelineStart))
+        return max(36, scale.x(for: edit.timelineStart + visibleDuration) - scale.x(for: edit.timelineStart))
+    }
+
+    private var timelineGesture: some Gesture {
+        DragGesture(minimumDistance: 2)
+            .onChanged { value in
+                if activeEdit == nil {
+                    guard let music = project.musicClips.reversed().first(where: { music in
+                        let edit = MusicEditDraft(trimStart: music.trimStart, trimEnd: music.trimEnd, timelineStart: music.timelineStart)
+                        let start = scale.x(for: edit.timelineStart)
+                        let width = displayWidth(for: music, edit: edit)
+                        return value.startLocation.x >= start && value.startLocation.x <= start + width && value.startLocation.y >= 14 && value.startLocation.y <= 62
+                    }) else { return }
+
+                    let edit = MusicEditDraft(trimStart: music.trimStart, trimEnd: music.trimEnd, timelineStart: music.timelineStart)
+                    let start = scale.x(for: edit.timelineStart)
+                    let width = displayWidth(for: music, edit: edit)
+                    let localX = value.startLocation.x - start
+                    let mode: MusicTimelineEditMode
+                    if localX <= 12 { mode = .trimStart }
+                    else if localX >= width - 12 { mode = .trimEnd }
+                    else { mode = .move }
+                    activeEdit = ActiveMusicEdit(musicID: music.id, initial: music, mode: mode)
+                    draft = edit
+                    project.selectMusic(music.id)
+                    project.beginMusicTimelineEdit()
+                }
+
+                guard let activeEdit, var draft else { return }
+                let music = activeEdit.initial
+                switch activeEdit.mode {
+                case .move:
+                    let newStart = scale.time(for: scale.x(for: music.timelineStart) + value.translation.width)
+                    let latestStart = max(0, videoDuration - music.duration)
+                    draft.timelineStart = min(max(0, newStart), latestStart)
+                case .trimStart:
+                    let newTimelineStart = min(max(0, scale.time(for: scale.x(for: music.timelineStart) + value.translation.width)), max(0, videoDuration - 0.1))
+                    let timelineDelta = newTimelineStart - music.timelineStart
+                    if timelineDelta >= 0 {
+                        draft.trimStart = min(music.trimStart + timelineDelta, music.trimEnd - 0.1)
+                        draft.trimEnd = music.trimEnd
+                        draft.timelineStart = newTimelineStart
+                    } else {
+                        let requestedExtension = -timelineDelta
+                        let extendFromStart = min(requestedExtension, music.trimStart)
+                        let extendFromEnd = min(requestedExtension - extendFromStart, music.sourceDuration - music.trimEnd)
+                        draft.trimStart = music.trimStart - extendFromStart
+                        draft.trimEnd = music.trimEnd + extendFromEnd
+                        draft.timelineStart = newTimelineStart
+                    }
+                case .trimEnd:
+                    let visibleEnd = min(videoDuration, music.timelineStart + music.duration)
+                    let newTimelineEnd = min(videoDuration, scale.time(for: scale.x(for: visibleEnd) + value.translation.width))
+                    draft.trimStart = music.trimStart
+                    draft.trimEnd = min(max(music.trimStart + 0.1, music.trimStart + newTimelineEnd - music.timelineStart), music.sourceDuration)
+                    draft.timelineStart = music.timelineStart
+                }
+                self.draft = draft
+            }
+            .onEnded { _ in
+                guard let activeEdit else { return }
+                if let draft {
+                    project.updateMusic(id: activeEdit.musicID, start: draft.trimStart, end: draft.trimEnd, timelineStart: draft.timelineStart)
+                }
+                self.draft = nil
+                self.activeEdit = nil
+                project.finishMusicTimelineEdit()
+            }
+    }
+}
+
+private struct TimelinePlayhead: View {
+    let height: CGFloat
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Circle()
+                .fill(.orange)
+                .frame(width: 10, height: 10)
+                .shadow(color: .black.opacity(0.45), radius: 2)
+            Rectangle()
+                .fill(.orange)
+                .frame(width: 2)
+                .shadow(color: .orange.opacity(0.7), radius: 2)
+        }
+        .frame(width: 10, height: height, alignment: .top)
+    }
+}
+
+private struct MusicTimelineClip: View {
+    @EnvironmentObject private var project: ProjectStore
+    let music: MusicClip
+    let scale: TimelineScale
+    let draft: MusicEditDraft?
+    /// The exported video ends at `videoDuration`, so the visual block must
+    /// end there too; otherwise its right trim handle would sit off-screen.
+    private var edit: MusicEditDraft { draft ?? MusicEditDraft(trimStart: music.trimStart, trimEnd: music.trimEnd, timelineStart: music.timelineStart) }
+    private var videoDuration: Double { scale.time(for: scale.totalWidth) }
+    private func visibleDuration(for edit: MusicEditDraft) -> Double { min(max(0.1, edit.trimEnd - edit.trimStart), max(0.1, videoDuration - edit.timelineStart)) }
+    private func center(for edit: MusicEditDraft) -> CGFloat {
+        scale.x(for: edit.timelineStart) + width / 2
+    }
+    private var naturalWidth: CGFloat { max(36, scale.x(for: edit.timelineStart + visibleDuration(for: edit)) - scale.x(for: edit.timelineStart)) }
+    private var width: CGFloat { naturalWidth }
+    private var isSelected: Bool { project.selectedMusicID == music.id }
+    private var showsTitle: Bool { width >= 110 }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 7).fill(Color.orange.opacity(isSelected ? 0.28 : 0.14))
+            if showsTitle {
+                HStack(spacing: 5) {
+                    Image(systemName: "music.note").foregroundStyle(.orange)
+                    Text(music.name).lineLimit(1).font(.caption.weight(.medium))
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 9)
+                .allowsHitTesting(false)
+            } else {
+                // A stable compact appearance avoids text reflow while a
+                // short clip is being moved or resized.
+                Image(systemName: "music.note")
+                    .foregroundStyle(.orange)
+                    .allowsHitTesting(false)
+            }
+            HStack {
+                trimHandle
+                Spacer()
+                trimHandle
+            }
+            .padding(.horizontal, 2)
+        }
+        .frame(width: width, height: 48)
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(isSelected ? Color.orange : .clear, lineWidth: 2))
+        .contentShape(Rectangle())
+        .onTapGesture { project.selectMusic(music.id) }
+        .position(x: center(for: edit), y: 38)
+    }
+
+    private var trimHandle: some View { Capsule().fill(Color.orange).frame(width: 6, height: 30).shadow(color: .orange.opacity(0.6), radius: 2).allowsHitTesting(false) }
+}
+
+private enum MusicTimelineEditMode { case move, trimStart, trimEnd }
+
+private struct ActiveMusicEdit {
+    let musicID: UUID
+    let initial: MusicClip
+    let mode: MusicTimelineEditMode
+}
+
+private struct MusicEditDraft {
+    var trimStart: Double
+    var trimEnd: Double
+    var timelineStart: Double
+}
+
 private struct ClipTile: View {
     @EnvironmentObject private var project: ProjectStore
     let clip: VideoClip
     let index: Int
+    let width: CGFloat
     let showInsertionBefore: Bool
     let showInsertionAfter: Bool
     private var isSelected: Bool { project.selectedID == clip.id }
-    static func displayWidth(for clip: VideoClip) -> CGFloat { CGFloat(max(152, min(275, clip.duration * 12 + 120))) }
-    private var width: CGFloat { Self.displayWidth(for: clip) }
+    private var isInsertionTarget: Bool { showInsertionBefore || showInsertionAfter }
+    private var displayName: String {
+        // Imported names often already carry a sequence prefix (for example,
+        // "3Market_Structures"). The timeline supplies its own order number,
+        // so show the useful name separately instead of duplicating it.
+        let withoutNumber = clip.name.drop(while: \.isNumber)
+        let withoutSeparator = withoutNumber.drop(while: { $0 == "_" || $0 == "-" || $0 == " " })
+        return withoutSeparator.isEmpty ? clip.name : String(withoutSeparator)
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .bottom) {
                 LinearGradient(colors: [Color(hue: Double((index * 47) % 360) / 360, saturation: 0.35, brightness: 0.42), Color.black.opacity(0.65)], startPoint: .topLeading, endPoint: .bottomTrailing)
                 HStack(alignment: .top) {
-                    Text("\(index + 1)").font(.caption2.weight(.bold)).foregroundStyle(.white.opacity(0.85)).padding(7)
-                    Spacer(); Image(systemName: "film").foregroundStyle(.white.opacity(0.55)).padding(7)
+                    if width >= 18 { Text("\(index + 1)").font(.caption2.weight(.bold)).foregroundStyle(.white.opacity(0.85)).padding(4) }
+                    Spacer()
+                    if width >= 130 { Image(systemName: "film").foregroundStyle(.white.opacity(0.55)).padding(7) }
                 }
-                HStack {
-                    Text(clip.name)
-                        .lineLimit(1)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.white)
-                    Spacer(minLength: 22)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                if width >= 130 {
+                    HStack {
+                        Text(displayName)
+                            .lineLimit(1)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.white)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.leading, 10)
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 8)
                 }
-                .padding(.leading, 15)
-                .padding(.trailing, 10)
-                .padding(.bottom, 8)
             }
             .frame(width: width, height: 91)
             .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(isSelected ? Color.orange : .clear, lineWidth: 3))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(
+                        isInsertionTarget ? Color.orange.opacity(0.85) : (isSelected ? Color.orange : .clear),
+                        lineWidth: isInsertionTarget ? 2 : 3
+                    )
+            )
             .overlay(alignment: .leading) {
                 if showInsertionBefore { insertionMarker }
             }
             .overlay(alignment: .trailing) {
                 if showInsertionAfter { insertionMarker }
             }
-            Text("\(clip.trimStart.timeLabel) — \(clip.trimEnd.timeLabel)").font(.caption2).monospacedDigit().foregroundStyle(isSelected ? .orange : .secondary)
-        }.contentShape(Rectangle()).onTapGesture { project.select(clip.id) }
+            if width >= 130 {
+                Text("\(clip.trimStart.timeLabel) — \(clip.trimEnd.timeLabel)")
+                    .font(.caption2).monospacedDigit().foregroundStyle(isSelected ? .orange : .secondary)
+                    .lineLimit(1)
+            } else {
+                Color.clear.frame(height: 12)
+            }
+        }
+        .frame(width: width, alignment: .leading)
+        .clipped()
+        .contentShape(Rectangle())
+        .onTapGesture { project.select(clip.id) }
     }
 
     private var insertionMarker: some View {
-        Capsule()
-            .fill(Color.orange)
-            .frame(width: 5, height: 106)
-            .shadow(color: .orange.opacity(0.75), radius: 5)
-            .offset(x: showInsertionBefore ? -5 : 5)
+        ZStack {
+            RoundedRectangle(cornerRadius: 5)
+                .fill(Color.orange.opacity(0.22))
+                .frame(width: 16, height: 91)
+            Capsule()
+                .fill(Color.orange)
+                .frame(width: 6, height: 91)
+                .shadow(color: .orange.opacity(0.9), radius: 6)
+            Image(systemName: showInsertionBefore ? "arrowtriangle.right.fill" : "arrowtriangle.left.fill")
+                .font(.caption2.weight(.black))
+                .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.45), radius: 1)
+        }
+        // Keep the full marker within the tile bounds. The prior offset put
+        // most of the thin line outside a clipped tile, making it easy to miss.
+        .padding(.horizontal, 3)
     }
 }
 

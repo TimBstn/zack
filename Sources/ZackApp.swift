@@ -45,6 +45,7 @@ struct ZackApp: App {
                 Button("Open Project…") { project.openProject() }.keyboardShortcut("o")
                 Divider()
                 Button("Import Videos…") { project.importVideos() }.keyboardShortcut("i")
+                Button("Import Music…") { project.importMusic() }.keyboardShortcut("i", modifiers: [.command, .shift])
                 Button("Export Video…") { project.requestExport() }.keyboardShortcut("e")
                     .disabled(project.clips.isEmpty)
             }
@@ -56,16 +57,16 @@ struct ZackApp: App {
                 Button("Redo") { project.redo() }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(!project.canRedo)
             }
             CommandGroup(replacing: .pasteboard) {
-                Button("Copy Clip") { project.copySelectedClip() }.keyboardShortcut("c")
-                    .disabled(project.selectedClip == nil)
-                Button("Paste Clip") { project.pasteClip() }.keyboardShortcut("v")
-                    .disabled(!project.canPasteClip)
+                Button("Copy Selected Item") { project.copySelectedTimelineItem() }.keyboardShortcut("c")
+                    .disabled(!project.hasSelectedTimelineItem)
+                Button("Paste Timeline Item") { project.pasteTimelineItem() }.keyboardShortcut("v")
+                    .disabled(!project.canPasteTimelineItem)
                 Divider()
-                Button("Duplicate Clip") { project.duplicateSelectedClip() }.keyboardShortcut("d")
-                    .disabled(project.selectedClip == nil)
+                Button("Duplicate Selected Item") { project.duplicateSelectedTimelineItem() }.keyboardShortcut("d")
+                    .disabled(!project.hasSelectedTimelineItem)
                 Divider()
-                Button("Delete Clip") { project.removeSelected() }.keyboardShortcut(.delete, modifiers: [])
-                    .disabled(project.selectedClip == nil)
+                Button("Delete Selected Item") { project.removeSelectedTimelineItem() }.keyboardShortcut(.delete, modifiers: [])
+                    .disabled(!project.hasSelectedTimelineItem)
             }
         }
         Settings { PreferencesView().environmentObject(project) }
@@ -144,7 +145,7 @@ private struct AboutView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 18)
-            Text("Version 0.2.0").font(.caption).foregroundStyle(.tertiary)
+            Text("Version 0.3.0").font(.caption).foregroundStyle(.tertiary)
             Text("© 2026 Zack Studio").font(.caption).foregroundStyle(.tertiary)
             Button("Done") { dismiss() }
                 .buttonStyle(.borderedProminent)
@@ -233,6 +234,12 @@ private struct HelpView: View {
                     HelpSection("Adjust audio") {
                         Text("Select a clip, then click the speaker button in the toolbar to open Audio controls. Use the volume slider to adjust that clip from mute to 200%; 100% preserves its original level. Zack measures the clip’s actual output peak after gain, so quiet and loud source videos read differently. Keep the output below the -1 dB safe ceiling; yellow and red can distort. Audio settings are saved with the project and included in the exported MP4.")
                     }
+                    HelpSection("Fade video clips") {
+                        Text("Select a video clip to open its Video sidebar. Open Transition to set Fade in or Fade out in seconds. Zack applies these fades to the full-video preview and exported MP4.")
+                    }
+                    HelpSection("Add music") {
+                        Text("Open the Music row below the video clips and use its + button to import audio. Music appears in its own lane, aligned with the video timeline. Drag a music block left or right to place it; it remains fully inside the finished video, so moving never changes its length. Drag either orange cutter directly for live trimming. Select it to adjust volume, Song offset (a later point inside the song), and optional fade-in or fade-out. Music mixes under video audio in preview and export. Command-C, Command-V, Command-D, and Delete work with selected music tiles just as they do with video clips.")
+                    }
                     HelpSection("Preview and trim") {
                         Text("Selected previews one source clip. Full Video previews the entire ordered, trimmed timeline. In Selected mode, drag the orange left and right cutters below the player to set the start and end of that clip. Click the trim bar to move the playhead. Press Space to play or pause.")
                     }
@@ -240,10 +247,10 @@ private struct HelpView: View {
                         Text("Choose Zack → Settings → Video to select YouTube Video (1920 × 1080, 16:9) for regular YouTube uploads, or Shorts & Reels (1080 × 1920, 9:16) for YouTube Shorts and Instagram Reels. The choice changes the preview and exported MP4. Zack preserves each clip’s aspect ratio and adds black bars rather than stretching footage.")
                     }
                     HelpSection("Subtitles") {
-                        Text("Click the captions button in the toolbar to generate subtitles for the full timeline with Zack’s bundled native Whisper engine and voice activity detection. No Python, Conda, or separate setup is required. Zack removes blank-audio markers from generated captions. Choose Zack → Settings → Subtitles to set the maximum characters per caption and whether captions should split on word boundaries. Zack saves an SRT in ~/Movies/Zack Subtitles and opens the inline subtitle editor. Choose a Caption style to change the full-video preview; Zack bundles its caption fonts so the look is consistent on every Mac. Open Caption layout to adjust size and position with sliders while watching the live preview. The selected style and layout are saved with your project. Switch to Full Video to see captions over the preview, then edit their text or Start and End times in the panel beside the player. Times accept 0:03.00, 1:02.50, or plain seconds and apply when you press Return or leave the field.")
+                        Text("Click the captions button in the toolbar to generate subtitles for the full timeline with Zack’s bundled native Whisper engine and voice activity detection. No Python, Conda, or separate setup is required. Zack transcribes the original video audio without background music, so music cannot confuse speech detection. Zack removes blank-audio markers from generated captions. Choose Zack → Settings → Subtitles to set the maximum characters per caption and whether captions should split on word boundaries. Zack saves an SRT in ~/Movies/Zack Subtitles and opens the inline subtitle editor. Choose a Caption style to change the full-video preview; Zack bundles its caption fonts so the look is consistent on every Mac. Open Caption layout to adjust size and position with sliders while watching the live preview. The selected style and layout are saved with your project. Switch to Full Video to see captions over the preview, then edit their text or Start and End times in the panel beside the player. Times accept 0:03.00, 1:02.50, or plain seconds and apply when you press Return or leave the field.")
                     }
                     HelpSection("Save and export") {
-                        Text("Choose File → Save Project (Command-S) to save clips, trim ranges, audio levels, timeline order, video output, and subtitle edits in a .zack project. The orange Export button renders the full timeline as an MP4. When closing an unsaved project, Zack asks whether to save your changes.")
+                        Text("Choose File → Save Project (Command-S) to save clips, music, trim ranges, audio levels, timeline order, video output, and subtitle edits in a .zack project. The orange Export button renders the full timeline as an MP4. When closing an unsaved project, Zack asks whether to save your changes.")
                     }
                 }
                 .padding(22)

@@ -10,6 +10,26 @@ struct VideoClip: Identifiable, Codable, Equatable {
     var trimEnd: Double
     /// A per-clip gain multiplier. One is the original recording level.
     var volume: Double = 1
+    /// Black fades at the beginning and end of this timeline clip.
+    var fadeInDuration: Double = 0
+    var fadeOutDuration: Double = 0
+
+    var duration: Double { max(0, trimEnd - trimStart) }
+    var assetRange: CMTimeRange { CMTimeRange(start: CMTime(seconds: trimStart, preferredTimescale: 600), duration: CMTime(seconds: duration, preferredTimescale: 600)) }
+}
+
+struct MusicClip: Identifiable, Codable, Equatable {
+    var id: UUID = UUID()
+    var sourceURL: URL
+    var name: String
+    var sourceDuration: Double
+    var trimStart: Double = 0
+    var trimEnd: Double
+    /// Position on the finished-video timeline, in seconds.
+    var timelineStart: Double = 0
+    var volume: Double = 0.35
+    var fadeInDuration: Double = 0
+    var fadeOutDuration: Double = 0
 
     var duration: Double { max(0, trimEnd - trimStart) }
     var assetRange: CMTimeRange { CMTimeRange(start: CMTime(seconds: trimStart, preferredTimescale: 600), duration: CMTime(seconds: duration, preferredTimescale: 600)) }
@@ -106,13 +126,15 @@ enum SubtitleStyle: String, Codable, CaseIterable, Identifiable {
 
 struct ZackProject: Codable {
     var clips: [VideoClip]
+    var musicClips: [MusicClip]
     var subtitles: [SubtitleCue]
     var subtitleStyle: SubtitleStyle
     var subtitleLayout: SubtitleLayout
     var outputFormat: VideoOutputFormat
 
-    init(clips: [VideoClip] = [], subtitles: [SubtitleCue] = [], subtitleStyle: SubtitleStyle = .classic, subtitleLayout: SubtitleLayout = SubtitleLayout(), outputFormat: VideoOutputFormat = .youtube) {
+    init(clips: [VideoClip] = [], musicClips: [MusicClip] = [], subtitles: [SubtitleCue] = [], subtitleStyle: SubtitleStyle = .classic, subtitleLayout: SubtitleLayout = SubtitleLayout(), outputFormat: VideoOutputFormat = .youtube) {
         self.clips = clips
+        self.musicClips = musicClips
         self.subtitles = subtitles
         self.subtitleStyle = subtitleStyle
         self.subtitleLayout = subtitleLayout

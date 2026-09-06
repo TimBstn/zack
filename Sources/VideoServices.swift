@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreVideo
 import Foundation
 
 struct SubtitleTranscriptionSettings: Sendable {
@@ -26,6 +27,19 @@ actor VideoMetadataService {
         let seconds = duration.seconds
         guard seconds.isFinite, seconds > 0 else { throw CocoaError(.fileReadCorruptFile) }
         return VideoClip(sourceURL: url, name: url.deletingPathExtension().lastPathComponent, sourceDuration: seconds, trimEnd: seconds)
+    }
+}
+
+actor MusicMetadataService {
+    func clip(for url: URL) async throws -> MusicClip {
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        let seconds = duration.seconds
+        guard seconds.isFinite, seconds > 0,
+              try await !asset.loadTracks(withMediaType: .audio).isEmpty else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return MusicClip(sourceURL: url, name: url.deletingPathExtension().lastPathComponent, sourceDuration: seconds, trimEnd: seconds)
     }
 }
 
@@ -83,11 +97,55 @@ struct RenderedTimeline {
 /// is aspect-fit on black, avoiding the distortion caused by stretching clips
 /// between horizontal and vertical formats.
 enum TimelineCompositionService {
-    static func make(clips: [VideoClip], outputFormat: VideoOutputFormat) async throws -> RenderedTimeline {
+    /// Reuses an already-rendered composition when only gain changes. This
+    /// avoids replacing the AVPlayer item (and flashing a blank preview).
+    static func liveAudioMix(clips: [VideoClip], musicClips: [MusicClip], composition: AVComposition) -> AVAudioMix? {
+        let tracks = composition.tracks(withMediaType: .audio)
+        guard !tracks.isEmpty else { return nil }
+        var parameters: [AVMutableAudioMixInputParameters] = []
+        let videoParameters = AVMutableAudioMixInputParameters(track: tracks[0])
+        var cursor = CMTime.zero
+        for clip in clips {
+            videoParameters.setVolume(Float(clip.volume), at: cursor)
+            cursor = cursor + clip.assetRange.duration
+        }
+        parameters.append(videoParameters)
+        for (music, track) in zip(musicClips, tracks.dropFirst()) {
+            let musicParameters = AVMutableAudioMixInputParameters(track: track)
+            let start = CMTime(seconds: music.timelineStart, preferredTimescale: 600)
+            let available = max(0, composition.duration.seconds - music.timelineStart)
+            applyMusicGain(music, to: musicParameters, at: start, duration: min(music.duration, available))
+            parameters.append(musicParameters)
+        }
+        let mix = AVMutableAudioMix()
+        mix.inputParameters = parameters
+        return mix
+    }
+
+    static func make(clips: [VideoClip], musicClips: [MusicClip] = [], outputFormat: VideoOutputFormat) async throws -> RenderedTimeline {
         let composition = AVMutableComposition()
         guard let videoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
             throw CocoaError(.coderInvalidValue)
         }
+        let totalDuration = clips.reduce(CMTime.zero) { $0 + $1.assetRange.duration }
+        // AVFoundation's default canvas is undefined wherever an opacity ramp
+        // makes a source transparent (often green on recent macOS releases).
+        // A real, opaque black video track is stable in both preview and export
+        // and avoids the Core Animation compositor that was crashing Zack.
+        let blackCanvasURL = try await makeBlackCanvas(
+            size: outputFormat.dimensions,
+            duration: totalDuration
+        )
+        let blackCanvasAsset = AVURLAsset(url: blackCanvasURL)
+        guard let blackCanvasSource = try await blackCanvasAsset.loadTracks(withMediaType: .video).first,
+              let blackCanvasTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        try blackCanvasTrack.insertTimeRange(
+            CMTimeRange(start: .zero, duration: totalDuration),
+            of: blackCanvasSource,
+            at: .zero
+        )
         let audioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
         let audioParameters = audioTrack.map { AVMutableAudioMixInputParameters(track: $0) }
         var cursor = CMTime.zero
@@ -106,13 +164,50 @@ enum TimelineCompositionService {
                 try await aspectFitTransform(for: sourceVideo, in: outputFormat.dimensions),
                 at: cursor
             )
-            instruction.layerInstructions = [layerInstruction]
+            let clipDuration = clip.assetRange.duration.seconds
+            let fadeIn = min(clip.fadeInDuration, clipDuration)
+            let fadeOut = min(clip.fadeOutDuration, max(0, clipDuration - fadeIn))
+            if fadeIn > 0 {
+                layerInstruction.setOpacityRamp(
+                    fromStartOpacity: 0,
+                    toEndOpacity: 1,
+                    timeRange: CMTimeRange(start: cursor, duration: CMTime(seconds: fadeIn, preferredTimescale: 600))
+                )
+            }
+            if fadeOut > 0 {
+                let fadeStart = cursor + CMTime(seconds: clipDuration - fadeOut, preferredTimescale: 600)
+                layerInstruction.setOpacityRamp(
+                    fromStartOpacity: 1,
+                    toEndOpacity: 0,
+                    timeRange: CMTimeRange(start: fadeStart, duration: CMTime(seconds: fadeOut, preferredTimescale: 600))
+                )
+            }
+            let blackLayerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: blackCanvasTrack)
+            instruction.layerInstructions = [layerInstruction, blackLayerInstruction]
             instructions.append(instruction)
             if let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first {
                 try? audioTrack?.insertTimeRange(clip.assetRange, of: sourceAudio, at: cursor)
                 audioParameters?.setVolume(Float(clip.volume), at: cursor)
             }
             cursor = cursor + clip.assetRange.duration
+        }
+
+        var musicParameters: [AVMutableAudioMixInputParameters] = []
+        for music in musicClips {
+            let asset = AVURLAsset(url: music.sourceURL)
+            guard let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first,
+                  let musicTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
+            let start = CMTime(seconds: music.timelineStart, preferredTimescale: 600)
+            let availableDuration = max(0, cursor.seconds - music.timelineStart)
+            guard availableDuration > 0 else { continue }
+            let playableRange = CMTimeRange(
+                start: music.assetRange.start,
+                duration: CMTime(seconds: min(music.duration, availableDuration), preferredTimescale: 600)
+            )
+            try? musicTrack.insertTimeRange(playableRange, of: sourceAudio, at: start)
+            let parameters = AVMutableAudioMixInputParameters(track: musicTrack)
+            applyMusicGain(music, to: parameters, at: start, duration: playableRange.duration.seconds)
+            musicParameters.append(parameters)
         }
 
         let videoComposition = AVMutableVideoComposition()
@@ -122,12 +217,83 @@ enum TimelineCompositionService {
         let audioMix: AVAudioMix?
         if let audioParameters {
             let mix = AVMutableAudioMix()
-            mix.inputParameters = [audioParameters]
+            mix.inputParameters = [audioParameters] + musicParameters
+            audioMix = mix
+        } else if !musicParameters.isEmpty {
+            let mix = AVMutableAudioMix()
+            mix.inputParameters = musicParameters
             audioMix = mix
         } else {
             audioMix = nil
         }
         return RenderedTimeline(composition: composition, videoComposition: videoComposition, audioMix: audioMix)
+    }
+
+    /// Generates two opaque black frames spanning the requested duration. The
+    /// file stays in the system temporary directory for the AVComposition to
+    /// read while previewing/exporting, and is cleared by macOS automatically.
+    private static func makeBlackCanvas(size: CGSize, duration: CMTime) async throws -> URL {
+        guard duration > .zero else { throw CocoaError(.fileWriteInvalidFileName) }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zack-black-canvas-\(UUID().uuidString).mov")
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(size.width),
+            AVVideoHeightKey: Int(size.height)
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = false
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: Int(size.width),
+            kCVPixelBufferHeightKey as String: Int(size.height),
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: attributes
+        )
+        guard writer.canAdd(input) else { throw CocoaError(.fileWriteUnknown) }
+        writer.add(input)
+        guard writer.startWriting() else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
+        writer.startSession(atSourceTime: .zero)
+
+        var pixelBuffer: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, Int(size.width), Int(size.height), kCVPixelFormatType_32BGRA, attributes as CFDictionary, &pixelBuffer) == kCVReturnSuccess,
+              let pixelBuffer else { throw CocoaError(.fileWriteUnknown) }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        if let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) {
+            memset(baseAddress, 0, CVPixelBufferGetDataSize(pixelBuffer))
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+
+        let frameDuration = CMTime(value: 1, timescale: 30)
+        let finalFrameTime = max(frameDuration, duration - frameDuration)
+        guard adaptor.append(pixelBuffer, withPresentationTime: .zero),
+              adaptor.append(pixelBuffer, withPresentationTime: finalFrameTime) else {
+            throw writer.error ?? CocoaError(.fileWriteUnknown)
+        }
+        input.markAsFinished()
+        await withCheckedContinuation { continuation in writer.finishWriting { continuation.resume() } }
+        guard writer.status == .completed else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
+        return url
+    }
+
+    private static func applyMusicGain(_ music: MusicClip, to parameters: AVMutableAudioMixInputParameters, at start: CMTime, duration: Double) {
+        guard duration > 0 else { return }
+        let fadeIn = min(music.fadeInDuration, duration)
+        let fadeOut = min(music.fadeOutDuration, max(0, duration - fadeIn))
+        let target = Float(music.volume)
+        if fadeIn > 0 {
+            parameters.setVolumeRamp(fromStartVolume: 0, toEndVolume: target, timeRange: CMTimeRange(start: start, duration: CMTime(seconds: fadeIn, preferredTimescale: 600)))
+        } else {
+            parameters.setVolume(target, at: start)
+        }
+        if fadeOut > 0 {
+            let fadeStart = start + CMTime(seconds: duration - fadeOut, preferredTimescale: 600)
+            parameters.setVolumeRamp(fromStartVolume: target, toEndVolume: 0, timeRange: CMTimeRange(start: fadeStart, duration: CMTime(seconds: fadeOut, preferredTimescale: 600)))
+        }
     }
 
     private static func aspectFitTransform(for track: AVAssetTrack, in canvas: CGSize) async throws -> CGAffineTransform {
@@ -154,8 +320,8 @@ enum TimelineCompositionService {
 }
 
 final class VideoExportService: @unchecked Sendable {
-    func export(clips: [VideoClip], outputFormat: VideoOutputFormat, to destination: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
-        let timeline = try await TimelineCompositionService.make(clips: clips, outputFormat: outputFormat)
+    func export(clips: [VideoClip], musicClips: [MusicClip] = [], outputFormat: VideoOutputFormat, to destination: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        let timeline = try await TimelineCompositionService.make(clips: clips, musicClips: musicClips, outputFormat: outputFormat)
         let preset = AVAssetExportPresetHighestQuality
         guard let session = AVAssetExportSession(asset: timeline.composition, presetName: preset) else { throw CocoaError(.coderInvalidValue) }
         if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
