@@ -33,6 +33,27 @@ other Mac app. See the [installation guide](docs/DISTRIBUTION.md) for details.
 You can copy a selected clip with Command-C and paste it with Command-V. This
 is useful for repeating a short moment or creating a transition.
 
+## Adjust audio
+
+Select a clip and click the speaker button in the toolbar to open **Audio**.
+Each clip has its own volume slider: **100%** keeps the recording’s original
+level, while 0% mutes it and values above 100% boost it. Zack measures the
+actual output peak of the trimmed clip after gain, so a quiet recording and a
+loud recording do not read the same at 100%. Keep the meter below the -1 dB
+safe ceiling; yellow and red can distort footage that was already loud. Audio
+levels are saved in the project and applied to the exported MP4.
+
+## Choose an output
+
+Choose **Zack → Settings → Video** before exporting:
+
+- **YouTube Video** — 1920 × 1080 (16:9) for normal, horizontal YouTube videos.
+- **Shorts & Reels** — 1080 × 1920 (9:16) for YouTube Shorts and Instagram Reels.
+
+The selected output changes both the preview and exported MP4. Zack keeps each
+clip’s original aspect ratio; footage that does not fill the selected frame is
+shown with black bars rather than stretched.
+
 ## Add subtitles
 
 Click the captions button in the toolbar to generate subtitles for the complete
@@ -55,7 +76,7 @@ project.
 ## Save your work
 
 Choose **File → Save Project** to create a `.zack` project. A project stores
-your clip order, trim ranges, and subtitles while continuing to reference the
+your clip order, trim ranges, audio levels, output format, and subtitles while continuing to reference the
 original video files on your Mac. Zack asks before closing a project with
 unsaved changes.
 

@@ -1,6 +1,18 @@
 import SwiftUI
 import AppKit
 
+enum ZackBranding {
+    static let icon: NSImage = {
+        let bundledIcon = Bundle.main.url(forResource: "Zack", withExtension: "icns")
+        let developmentIcon = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Resources/Branding/Zack.icns")
+        for url in [bundledIcon, developmentIcon] {
+            if let url, let image = NSImage(contentsOf: url) { return image }
+        }
+        return NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "Zack") ?? NSImage()
+    }()
+}
+
 @main
 struct ZackApp: App {
     @NSApplicationDelegateAdaptor(ZackAppDelegate.self) private var appDelegate
@@ -56,7 +68,7 @@ struct ZackApp: App {
                     .disabled(project.selectedClip == nil)
             }
         }
-        Settings { PreferencesView() }
+        Settings { PreferencesView().environmentObject(project) }
     }
 }
 
@@ -124,7 +136,7 @@ private struct AboutView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 60, height: 60)
+            Image(nsImage: ZackBranding.icon).resizable().frame(width: 60, height: 60)
             Text("Zack").font(.title2.weight(.semibold))
             Text("A simpler way to make a cut.").foregroundStyle(.secondary)
             Text("Tired of overpriced, overcomplicated video editing software? Zack is the slim, easy-to-use solution: just the tools you need to shape and share your video.")
@@ -143,11 +155,32 @@ private struct AboutView: View {
 }
 
 private struct PreferencesView: View {
+    @EnvironmentObject private var project: ProjectStore
     @AppStorage(SubtitleTranscriptionSettings.maximumCharactersKey) private var maximumCharacters = 15
     @AppStorage(SubtitleTranscriptionSettings.splitOnWordBoundariesKey) private var splitOnWordBoundaries = true
 
     var body: some View {
         TabView {
+            Form {
+                Section("Format") {
+                    Picker("Video output", selection: Binding(
+                        get: { project.outputFormat },
+                        set: { project.updateOutputFormat($0) }
+                    )) {
+                        ForEach(VideoOutputFormat.allCases) { format in
+                            Text("\(format.name) (\(format.detail))").tag(format)
+                        }
+                    }
+                }
+                Section {
+                    Text("YouTube Video is 1920 × 1080 (16:9). Shorts & Reels is 1080 × 1920 (9:16), suitable for YouTube Shorts and Instagram Reels. Zack fits footage inside the selected frame and adds black bars instead of stretching it.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            .tabItem { Label("Video", systemImage: "rectangle.on.rectangle") }
+
             Form {
                 Section("Caption layout") {
                     Stepper(value: $maximumCharacters, in: 5...80) {
@@ -197,14 +230,20 @@ private struct HelpView: View {
                     HelpSection("Arrange your video") {
                         Text("Click a clip in the timeline to select it. Drag the whole clip tile left or right to reorder it. Use Command-C and Command-V to copy and paste a selected clip, or Command-D to duplicate it immediately after itself.")
                     }
+                    HelpSection("Adjust audio") {
+                        Text("Select a clip, then click the speaker button in the toolbar to open Audio controls. Use the volume slider to adjust that clip from mute to 200%; 100% preserves its original level. Zack measures the clip’s actual output peak after gain, so quiet and loud source videos read differently. Keep the output below the -1 dB safe ceiling; yellow and red can distort. Audio settings are saved with the project and included in the exported MP4.")
+                    }
                     HelpSection("Preview and trim") {
                         Text("Selected previews one source clip. Full Video previews the entire ordered, trimmed timeline. In Selected mode, drag the orange left and right cutters below the player to set the start and end of that clip. Click the trim bar to move the playhead. Press Space to play or pause.")
                     }
+                    HelpSection("Video output") {
+                        Text("Choose Zack → Settings → Video to select YouTube Video (1920 × 1080, 16:9) for regular YouTube uploads, or Shorts & Reels (1080 × 1920, 9:16) for YouTube Shorts and Instagram Reels. The choice changes the preview and exported MP4. Zack preserves each clip’s aspect ratio and adds black bars rather than stretching footage.")
+                    }
                     HelpSection("Subtitles") {
-                        Text("Click the captions button in the toolbar to generate subtitles for the full timeline with Zack’s bundled native Whisper engine and voice activity detection. No Python, Conda, or separate setup is required. Zack removes blank-audio markers from generated captions. Choose Zack → Settings → Subtitles to set the maximum characters per caption and whether captions should split on word boundaries. Zack saves an SRT in ~/Movies/Zack Subtitles and opens the inline subtitle editor. Switch to Full Video to see captions over the preview, then edit their text or Start and End times in the panel beside the player. Times accept 0:03.00, 1:02.50, or plain seconds and apply when you press Return or leave the field.")
+                        Text("Click the captions button in the toolbar to generate subtitles for the full timeline with Zack’s bundled native Whisper engine and voice activity detection. No Python, Conda, or separate setup is required. Zack removes blank-audio markers from generated captions. Choose Zack → Settings → Subtitles to set the maximum characters per caption and whether captions should split on word boundaries. Zack saves an SRT in ~/Movies/Zack Subtitles and opens the inline subtitle editor. Choose a Caption style to change the full-video preview; Zack bundles its caption fonts so the look is consistent on every Mac. Open Caption layout to adjust size and position with sliders while watching the live preview. The selected style and layout are saved with your project. Switch to Full Video to see captions over the preview, then edit their text or Start and End times in the panel beside the player. Times accept 0:03.00, 1:02.50, or plain seconds and apply when you press Return or leave the field.")
                     }
                     HelpSection("Save and export") {
-                        Text("Choose File → Save Project (Command-S) to save clips, trim ranges, timeline order, and subtitle edits in a .zack project. The orange Export button renders the full timeline as an MP4. When closing an unsaved project, Zack asks whether to save your changes.")
+                        Text("Choose File → Save Project (Command-S) to save clips, trim ranges, audio levels, timeline order, video output, and subtitle edits in a .zack project. The orange Export button renders the full timeline as an MP4. When closing an unsaved project, Zack asks whether to save your changes.")
                     }
                 }
                 .padding(22)

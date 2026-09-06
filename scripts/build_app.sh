@@ -14,10 +14,11 @@ if [[ ! -x "${whisper_bin_dir}/whisper-cli" ]]; then
     "${script_dir}/build_whisper_runtime.sh"
 fi
 rm -rf "${app_path}"
-mkdir -p "${app_path}/Contents/MacOS" "${app_path}/Contents/Frameworks" "${app_path}/Contents/Resources/Whisper"
+mkdir -p "${app_path}/Contents/MacOS" "${app_path}/Contents/Frameworks" "${app_path}/Contents/Resources/Whisper" "${app_path}/Contents/Resources/Fonts"
 cp "${bin_path}/Zack" "${app_path}/Contents/MacOS/Zack"
 cp "${project_dir}/Resources/Info.plist" "${app_path}/Contents/Info.plist"
 cp "${project_dir}/Resources/Branding/Zack.icns" "${app_path}/Contents/Resources/Zack.icns"
+cp -R "${project_dir}/Resources/Fonts/." "${app_path}/Contents/Resources/Fonts/"
 cp "${whisper_bin_dir}/whisper-cli" "${app_path}/Contents/MacOS/whisper-cli"
 for library in libwhisper.1.dylib libggml.0.dylib libggml-cpu.0.dylib libggml-blas.0.dylib libggml-base.0.dylib; do
     cp -L "${whisper_bin_dir}/${library}" "${app_path}/Contents/Frameworks/${library}"

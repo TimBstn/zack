@@ -29,17 +29,69 @@ actor VideoMetadataService {
     }
 }
 
-/// Builds the same ordered, trimmed timeline used for export, but keeps it in
-/// memory so the editor can play it immediately.
-enum VideoPreviewCompositionService {
-    @MainActor
-    static func make(clips: [VideoClip]) async throws -> AVMutableComposition {
+/// Reads the actual PCM samples in a trimmed clip to find its loudest output
+/// sample. The UI adds the user's gain setting to this value, so the meter is
+/// meaningful for both quiet and already-loud source recordings.
+actor AudioLevelAnalysisService {
+    func peakDecibels(for clip: VideoClip) async -> Double? {
+        let asset = AVURLAsset(url: clip.sourceURL)
+        guard let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first else { return nil }
+
+        do {
+            let reader = try AVAssetReader(asset: asset)
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: 44_100,
+                AVNumberOfChannelsKey: 1,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsNonInterleaved: false
+            ]
+            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: settings)
+            guard reader.canAdd(output) else { return nil }
+            reader.add(output)
+            reader.timeRange = clip.assetRange
+            guard reader.startReading() else { return nil }
+
+            var peak: Float = 0
+            while reader.status == .reading, let sampleBuffer = output.copyNextSampleBuffer() {
+                guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+                let byteCount = CMBlockBufferGetDataLength(blockBuffer)
+                guard byteCount >= MemoryLayout<Float>.size else { continue }
+                var samples = [Float](repeating: 0, count: byteCount / MemoryLayout<Float>.size)
+                _ = samples.withUnsafeMutableBytes { destination in
+                    CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: byteCount, destination: destination.baseAddress!)
+                }
+                for sample in samples { peak = max(peak, abs(sample)) }
+            }
+            guard reader.status == .completed else { return nil }
+            // -80 dB is a useful floor for silent or near-silent footage.
+            return max(-80, 20 * log10(max(Double(peak), 0.000_000_01)))
+        } catch {
+            return nil
+        }
+    }
+}
+
+struct RenderedTimeline {
+    let composition: AVMutableComposition
+    let videoComposition: AVMutableVideoComposition
+    let audioMix: AVAudioMix?
+}
+
+/// Builds a fixed-size output canvas for both preview and export. Every source
+/// is aspect-fit on black, avoiding the distortion caused by stretching clips
+/// between horizontal and vertical formats.
+enum TimelineCompositionService {
+    static func make(clips: [VideoClip], outputFormat: VideoOutputFormat) async throws -> RenderedTimeline {
         let composition = AVMutableComposition()
         guard let videoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
             throw CocoaError(.coderInvalidValue)
         }
         let audioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+        let audioParameters = audioTrack.map { AVMutableAudioMixInputParameters(track: $0) }
         var cursor = CMTime.zero
+        var instructions: [AVMutableVideoCompositionInstruction] = []
 
         for clip in clips {
             let asset = AVURLAsset(url: clip.sourceURL)
@@ -47,33 +99,67 @@ enum VideoPreviewCompositionService {
                 throw CocoaError(.fileReadCorruptFile)
             }
             try videoTrack.insertTimeRange(clip.assetRange, of: sourceVideo, at: cursor)
+            let instruction = AVMutableVideoCompositionInstruction()
+            instruction.timeRange = CMTimeRange(start: cursor, duration: clip.assetRange.duration)
+            let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+            layerInstruction.setTransform(
+                try await aspectFitTransform(for: sourceVideo, in: outputFormat.dimensions),
+                at: cursor
+            )
+            instruction.layerInstructions = [layerInstruction]
+            instructions.append(instruction)
             if let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first {
                 try? audioTrack?.insertTimeRange(clip.assetRange, of: sourceAudio, at: cursor)
+                audioParameters?.setVolume(Float(clip.volume), at: cursor)
             }
             cursor = cursor + clip.assetRange.duration
         }
-        return composition
+
+        let videoComposition = AVMutableVideoComposition()
+        videoComposition.renderSize = outputFormat.dimensions
+        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+        videoComposition.instructions = instructions
+        let audioMix: AVAudioMix?
+        if let audioParameters {
+            let mix = AVMutableAudioMix()
+            mix.inputParameters = [audioParameters]
+            audioMix = mix
+        } else {
+            audioMix = nil
+        }
+        return RenderedTimeline(composition: composition, videoComposition: videoComposition, audioMix: audioMix)
+    }
+
+    private static func aspectFitTransform(for track: AVAssetTrack, in canvas: CGSize) async throws -> CGAffineTransform {
+        let naturalSize = try await track.load(.naturalSize)
+        let preferredTransform = try await track.load(.preferredTransform)
+        let transformedBounds = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
+        let orientedSize = CGSize(width: abs(transformedBounds.width), height: abs(transformedBounds.height))
+        guard orientedSize.width > 0, orientedSize.height > 0 else { throw CocoaError(.fileReadCorruptFile) }
+
+        let scale = min(canvas.width / orientedSize.width, canvas.height / orientedSize.height)
+        let fittedSize = CGSize(width: orientedSize.width * scale, height: orientedSize.height * scale)
+        let centering = CGPoint(
+            x: (canvas.width - fittedSize.width) / 2,
+            y: (canvas.height - fittedSize.height) / 2
+        )
+
+        // Normalize the track's preferred orientation to its own origin, then
+        // scale and center it on the requested black output canvas.
+        return preferredTransform
+            .concatenating(CGAffineTransform(translationX: -transformedBounds.minX, y: -transformedBounds.minY))
+            .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+            .concatenating(CGAffineTransform(translationX: centering.x, y: centering.y))
     }
 }
 
 final class VideoExportService: @unchecked Sendable {
-    func export(clips: [VideoClip], to destination: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
-        let composition = AVMutableComposition()
-        guard let videoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { throw CocoaError(.coderInvalidValue) }
-        let audioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-        var cursor = CMTime.zero
-        for clip in clips {
-            let asset = AVURLAsset(url: clip.sourceURL)
-            let sourceVideo = try await asset.loadTracks(withMediaType: .video).first
-            guard let sourceVideo else { throw CocoaError(.fileReadCorruptFile) }
-            try videoTrack.insertTimeRange(clip.assetRange, of: sourceVideo, at: cursor)
-            if let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first { try? audioTrack?.insertTimeRange(clip.assetRange, of: sourceAudio, at: cursor) }
-            cursor = cursor + clip.assetRange.duration
-        }
+    func export(clips: [VideoClip], outputFormat: VideoOutputFormat, to destination: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        let timeline = try await TimelineCompositionService.make(clips: clips, outputFormat: outputFormat)
         let preset = AVAssetExportPresetHighestQuality
-        guard let session = AVAssetExportSession(asset: composition, presetName: preset) else { throw CocoaError(.coderInvalidValue) }
+        guard let session = AVAssetExportSession(asset: timeline.composition, presetName: preset) else { throw CocoaError(.coderInvalidValue) }
         if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-        session.outputURL = destination; session.outputFileType = .mp4; session.shouldOptimizeForNetworkUse = true
+        session.outputURL = destination; session.outputFileType = .mp4; session.videoComposition = timeline.videoComposition; session.audioMix = timeline.audioMix; session.shouldOptimizeForNetworkUse = true
         await session.export()
         progress(1)
         guard session.status == .completed else { throw session.error ?? CocoaError(.fileWriteUnknown) }

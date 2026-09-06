@@ -10,8 +10,13 @@ final class ProjectStore: ObservableObject {
     @Published var exportState: ExportState = .idle
     @Published var subtitleState: SubtitleState = .idle
     @Published var subtitles: [SubtitleCue] = []
+    @Published var subtitleStyle: SubtitleStyle = .classic
+    @Published var subtitleLayout = SubtitleLayout()
+    @Published var outputFormat: VideoOutputFormat = .youtube
     @Published var playbackToggleCount = 0
     @Published var isSubtitleEditorVisible = false
+    @Published var isSubtitleLayoutEditorVisible = false
+    @Published var isAudioEditorVisible = false
     @Published private(set) var hasUnsavedChanges = false
     @Published var errorMessage: String?
     @Published var isImporting = false
@@ -53,7 +58,37 @@ final class ProjectStore: ObservableObject {
         return true
     }
 
-    func newProject() { clips = []; subtitles = []; selectedID = nil; projectURL = nil; hasUnsavedChanges = false }
+    func updateSubtitleStyle(_ style: SubtitleStyle) {
+        guard subtitleStyle != style else { return }
+        subtitleStyle = style
+        hasUnsavedChanges = true
+    }
+
+    func updateSubtitleLayout(horizontalOffset: Double? = nil, verticalOffset: Double? = nil, scale: Double? = nil) {
+        if let horizontalOffset { subtitleLayout.horizontalOffset = min(max(horizontalOffset, -0.42), 0.42) }
+        if let verticalOffset { subtitleLayout.verticalOffset = min(max(verticalOffset, -0.45), 0.45) }
+        if let scale { subtitleLayout.scale = min(max(scale, 0.55), 2.1) }
+        hasUnsavedChanges = true
+    }
+
+    func resetSubtitleLayout() {
+        subtitleLayout = SubtitleLayout()
+        hasUnsavedChanges = true
+    }
+
+    func updateOutputFormat(_ format: VideoOutputFormat) {
+        guard outputFormat != format else { return }
+        outputFormat = format
+        hasUnsavedChanges = true
+    }
+
+    func updateClipVolume(id: UUID, volume: Double) {
+        guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
+        clips[index].volume = min(max(volume, 0), 2)
+        hasUnsavedChanges = true
+    }
+
+    func newProject() { clips = []; subtitles = []; subtitleStyle = .classic; subtitleLayout = SubtitleLayout(); outputFormat = .youtube; isSubtitleLayoutEditorVisible = false; isAudioEditorVisible = false; selectedID = nil; projectURL = nil; hasUnsavedChanges = false }
     func importVideos() {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie]
         panel.allowsMultipleSelection = true; panel.canChooseDirectories = false
@@ -102,13 +137,14 @@ final class ProjectStore: ObservableObject {
         guard !clips.isEmpty else { return }
         subtitleState = .rendering
         let timeline = clips
+        let selectedOutputFormat = outputFormat
         let transcriptionSettings = SubtitleTranscriptionSettings.current
         let temporaryVideo = FileManager.default.temporaryDirectory
             .appendingPathComponent("Zack-Timeline-\(UUID().uuidString)")
             .appendingPathExtension("mp4")
         Task {
             do {
-                _ = try await exporter.export(clips: timeline, to: temporaryVideo, progress: { _ in })
+                _ = try await exporter.export(clips: timeline, outputFormat: selectedOutputFormat, to: temporaryVideo, progress: { _ in })
                 defer { try? FileManager.default.removeItem(at: temporaryVideo) }
                 subtitleState = .transcribing
                 subtitles = try await whisper.transcribe(
@@ -152,13 +188,14 @@ final class ProjectStore: ObservableObject {
     func undo() { guard let old = undoStack.popLast() else { return }; redoStack.append(clips); clips = old; selectedID = clips.first?.id; hasUnsavedChanges = true }
     func redo() { guard let next = redoStack.popLast() else { return }; undoStack.append(clips); clips = next; selectedID = clips.first?.id; hasUnsavedChanges = true }
     func requestExport() {
-        let panel = NSSavePanel(); panel.allowedContentTypes = [.mpeg4Movie]; panel.nameFieldStringValue = "My Reel.mp4"
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.mpeg4Movie]; panel.nameFieldStringValue = outputFormat == .instagram ? "My Reel.mp4" : "My YouTube Video.mp4"
         if panel.runModal() == .OK, let url = panel.url { export(to: url) }
     }
     func export(to url: URL) {
         guard !clips.isEmpty else { return }; exportState = .exporting(0)
+        let selectedOutputFormat = outputFormat
         Task {
-            do { let output = try await exporter.export(clips: clips, to: url) { progress in Task { @MainActor in self.exportState = .exporting(progress) } }; exportState = .success(output) }
+            do { let output = try await exporter.export(clips: clips, outputFormat: selectedOutputFormat, to: url) { progress in Task { @MainActor in self.exportState = .exporting(progress) } }; exportState = .success(output) }
             catch { exportState = .failure("Your video couldn’t be exported. Check that the destination has free space and try again.") }
         }
     }
@@ -171,7 +208,7 @@ final class ProjectStore: ObservableObject {
     }
     private func writeProject(to url: URL) -> Bool {
         do {
-            try JSONEncoder().encode(ZackProject(clips: clips, subtitles: subtitles)).write(to: url)
+            try JSONEncoder().encode(ZackProject(clips: clips, subtitles: subtitles, subtitleStyle: subtitleStyle, subtitleLayout: subtitleLayout, outputFormat: outputFormat)).write(to: url)
             projectURL = url
             hasUnsavedChanges = false
             return true
@@ -180,5 +217,5 @@ final class ProjectStore: ObservableObject {
             return false
         }
     }
-    func openProject() { let panel = NSOpenPanel(); panel.allowedContentTypes = [.init(filenameExtension: "zack")!]; if panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url), let project = try? JSONDecoder().decode(ZackProject.self, from: data) { clips = project.clips; subtitles = project.subtitles; selectedID = clips.first?.id; projectURL = url; hasUnsavedChanges = false } }
+    func openProject() { let panel = NSOpenPanel(); panel.allowedContentTypes = [.init(filenameExtension: "zack")!]; if panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url), let project = try? JSONDecoder().decode(ZackProject.self, from: data) { clips = project.clips; subtitles = project.subtitles; subtitleStyle = project.subtitleStyle; subtitleLayout = project.subtitleLayout; outputFormat = project.outputFormat; isSubtitleLayoutEditorVisible = false; isAudioEditorVisible = false; selectedID = clips.first?.id; projectURL = url; hasUnsavedChanges = false } }
 }

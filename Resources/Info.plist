@@ -18,6 +18,8 @@
     <string>Zack.icns</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>ATSApplicationFontsPath</key>
+    <string>Fonts</string>
     <key>CFBundleShortVersionString</key>
     <string>0.2.0</string>
     <key>CFBundleVersion</key>
